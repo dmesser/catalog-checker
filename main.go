@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,19 @@ type ParsedImageRef struct {
 	Type       ImageType `json:"type"`
 }
 
+type ImageReferenceFailure string
+
+const (
+	ManifestNotFound ImageReferenceFailure = "manifest-not-found"
+	InvalidReference ImageReferenceFailure = "invalid-reference"
+	AuthError        ImageReferenceFailure = "auth-error"
+)
+
+type FailedImageRef struct {
+	ImageRef ParsedImageRef
+	Reason   ImageReferenceFailure
+}
+
 type CheckImageContext struct {
 	ImageRef ParsedImageRef
 	Sys      *types.SystemContext
@@ -69,7 +83,7 @@ var (
 )
 
 var (
-	failedImageRefs []ParsedImageRef
+	failedImageRefs []FailedImageRef
 )
 
 func readFileWithProgress(filename string, progress *mpb.Progress) ([]byte, error) {
@@ -121,7 +135,7 @@ func readFileWithProgress(filename string, progress *mpb.Progress) ([]byte, erro
 }
 
 func runChecker(cmd *cobra.Command, args []string) {
-	p := mpb.New(mpb.WithWidth(64))
+	p := mpb.New(mpb.WithWidth(64), mpb.WithOutput(os.Stderr))
 
 	fmt.Printf("Checking catalog file %s ...\n", catalogFile)
 
@@ -209,7 +223,7 @@ func runChecker(cmd *cobra.Command, args []string) {
 		}
 		defer f.Close()
 
-		_, err = f.WriteString("package,bundlename,image,type\n")
+		_, err = f.WriteString("package,bundlename,image,type,failure\n")
 		if err != nil {
 			panic(err)
 		}
@@ -217,21 +231,22 @@ func runChecker(cmd *cobra.Command, args []string) {
 		// Sort the failed image references
 		sort.Slice(failedImageRefs, func(i, j int) bool {
 			return func() bool {
-				if failedImageRefs[i].Package != failedImageRefs[j].Package {
-					return failedImageRefs[i].Package < failedImageRefs[j].Package
+				if failedImageRefs[i].ImageRef.Package != failedImageRefs[j].ImageRef.Package {
+					return failedImageRefs[i].ImageRef.Package < failedImageRefs[j].ImageRef.Package
 				}
-				if failedImageRefs[i].BundleName != failedImageRefs[j].BundleName {
-					return failedImageRefs[i].BundleName < failedImageRefs[j].BundleName
+				if failedImageRefs[i].ImageRef.BundleName != failedImageRefs[j].ImageRef.BundleName {
+					return failedImageRefs[i].ImageRef.BundleName < failedImageRefs[j].ImageRef.BundleName
 				}
-				if failedImageRefs[i].Image != failedImageRefs[j].Image {
-					return failedImageRefs[i].Image < failedImageRefs[j].Image
+				if failedImageRefs[i].ImageRef.Image != failedImageRefs[j].ImageRef.Image {
+					return failedImageRefs[i].ImageRef.Image < failedImageRefs[j].ImageRef.Image
 				}
-				return failedImageRefs[i].Type < failedImageRefs[j].Type
+				return failedImageRefs[i].ImageRef.Type < failedImageRefs[j].ImageRef.Type
 			}()
 		})
 
 		for _, img := range failedImageRefs {
-			_, err = f.WriteString(fmt.Sprintf("%s,%s,%s,%s\n", img.Package, img.BundleName, img.Image, img.Type))
+			var imageRef = img.ImageRef
+			_, err = f.WriteString(fmt.Sprintf("%s,%s,%s,%s,%s\n", imageRef.Package, imageRef.BundleName, imageRef.Image, imageRef.Type, img.Reason))
 			if err != nil {
 				panic(err)
 			}
@@ -267,21 +282,29 @@ func checkImage(ctx CheckImageContext) {
 
 	ref, err := docker.ParseReference("//" + ctx.ImageRef.Image)
 	if err != nil {
-		captureError(ctx.ImageRef, fmt.Sprintf("Failed to parse image reference: %v", err))
+		captureError(ctx.ImageRef, InvalidReference, fmt.Sprintf("Failed to parse image reference: %v", err), ctx.Progress)
 		<-ctx.Sem
 		return
 	}
 
 	src, err := ref.NewImageSource(context.Background(), ctx.Sys)
 	if err != nil {
-		captureError(ctx.ImageRef, fmt.Sprintf("Cannot create image resource: %v", err))
+		var reason ImageReferenceFailure = InvalidReference
+
+		if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "denied") {
+			reason = AuthError
+		} else if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "unknown") {
+			reason = ManifestNotFound
+		}
+
+		captureError(ctx.ImageRef, reason, fmt.Sprintf("Cannot create image resource: %v", err), ctx.Progress)
 		<-ctx.Sem
 		return
 	}
 
 	_, _, err = src.GetManifest(context.Background(), nil)
 	if err != nil {
-		captureError(ctx.ImageRef, fmt.Sprintf("Cannot get manifest: %v", err))
+		captureError(ctx.ImageRef, ManifestNotFound, fmt.Sprintf("Cannot get manifest: %v", err), ctx.Progress)
 
 		if src != nil {
 			src.Close()
@@ -294,19 +317,19 @@ func checkImage(ctx CheckImageContext) {
 	<-ctx.Sem
 }
 
-func captureError(imageRef ParsedImageRef, errorMessage string) {
+func captureError(imageRef ParsedImageRef, failure ImageReferenceFailure, errorMessage string, p *mpb.Progress) {
 
-	failedImageRefs = append(failedImageRefs, imageRef)
+	failedImageRefs = append(failedImageRefs, FailedImageRef{imageRef, failure})
 
 	if showErrors {
 		if imageRef.Type == BundleImage {
-			fmt.Fprintf(os.Stderr,
-				"Operator bundle image %s from operator bundle '%s' in package '%s' cannot be found: %s\n",
+			fmt.Fprintf(p,
+				"Error processing operator bundle image %s from operator bundle '%s' in package '%s' cannot be found: %s\n",
 				imageRef.Image, imageRef.BundleName, imageRef.Package, errorMessage,
 			)
 		} else {
-			fmt.Fprintf(os.Stderr,
-				"Related image %s from operator bundle '%s' in package '%s' cannot be found: %s\n",
+			fmt.Fprintf(p,
+				"Error processing related image %s from operator bundle '%s' in package '%s' cannot be found: %s\n",
 				imageRef.Image, imageRef.BundleName, imageRef.Package, errorMessage,
 			)
 		}
@@ -314,12 +337,12 @@ func captureError(imageRef ParsedImageRef, errorMessage string) {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&catalogFile, "catalog", "", "Path to the file-based catalog JSON file")
+	rootCmd.PersistentFlags().StringVarP(&catalogFile, "catalog", "c", "", "Path to the file-based catalog JSON file")
 	rootCmd.MarkPersistentFlagRequired("catalog")
 	rootCmd.PersistentFlags().BoolVar(&showErrors, "show-errors", false, "Whether to output errors on ")
 	rootCmd.PersistentFlags().StringVar(&csvFile, "csv", "", "Path to a CSV file to write the results to")
-	rootCmd.PersistentFlags().StringVar(&authFile, "auth", "", "Path to Docker auth file")
-	rootCmd.PersistentFlags().IntVar(&parallelCount, "parallel", 0, "Number of parallel checks")
+	rootCmd.PersistentFlags().StringVarP(&authFile, "auth", "a", "", "Path to Docker auth file")
+	rootCmd.PersistentFlags().IntVarP(&parallelCount, "parallel", "p", 0, "Number of parallel checks")
 }
 
 func main() {
